@@ -1,0 +1,195 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+env:
+  DOCKER_BUILDKIT: 1
+  COMPOSE_DOCKER_CLI_BUILD: 1
+
+jobs:
+  # -----------------------------------------------------------------------
+  # CI: Build and test Docker images for each service on every commit
+  # -----------------------------------------------------------------------
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Lint Python files (syntax check)
+        run: |
+          python -m py_compile airflow/dags/faker_to_minio.py
+          python -m py_compile airflow/dags/data_generator.py
+          python -m py_compile airflow/dags/medallion_pipeline_dag.py
+          python -m py_compile src/data_processor.py
+          python -m py_compile src/data_validation.py
+          python -m py_compile scripts/load_to_postgres.py
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Validate Docker Compose configuration
+        run: docker compose config --quiet
+
+      - name: Build Airflow Docker image
+        run: docker compose build airflow-init
+
+  # -----------------------------------------------------------------------
+  # CD: Deploy updated containers to a test environment automatically
+  # -----------------------------------------------------------------------
+  deploy-test:
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Start all services
+        run: |
+          docker compose up -d --build --wait
+        timeout-minutes: 10
+
+      - name: Wait for services to be healthy
+        run: |
+          echo "Waiting for PostgreSQL..."
+          for i in $(seq 1 30); do
+            docker exec mdp_postgres pg_isready -U mdp_user -d mdp_db && break
+            echo "  attempt $i/30 — waiting 5s..."
+            sleep 5
+          done
+
+          echo "Waiting for Airflow webserver..."
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:8080/health && break
+            echo "  attempt $i/30 — waiting 5s..."
+            sleep 5
+          done
+
+          echo "Waiting for MinIO..."
+          for i in $(seq 1 20); do
+            curl -sf http://localhost:9000/minio/health/live && break
+            echo "  attempt $i/20 — waiting 5s..."
+            sleep 5
+          done
+
+      - name: Show running containers
+        run: docker compose ps
+
+      - name: Tear down test environment
+        if: always()
+        run: docker compose down -v
+
+  # -----------------------------------------------------------------------
+  # Data Flow Validation: automated end-to-end data flow check
+  # MinIO → Airflow → PostgreSQL (bronze → silver → gold) → Metabase-ready
+  # -----------------------------------------------------------------------
+  data-flow-validation:
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Start all services
+        run: docker compose up -d --build --wait
+        timeout-minutes: 10
+
+      - name: Wait for PostgreSQL to be ready
+        run: |
+          for i in $(seq 1 30); do
+            docker exec mdp_postgres pg_isready -U mdp_user -d mdp_db && break
+            sleep 5
+          done
+
+      - name: Initialize medallion schemas
+        run: |
+          docker exec mdp_airflow_scheduler python -c "
+          from src.data_processor import init_medallion_schemas
+          init_medallion_schemas()
+          print('Schemas initialized successfully.')
+          "
+
+      - name: "Data Flow 1/4: Ingest — generate fake data and upload to MinIO"
+        run: |
+          docker exec mdp_airflow_scheduler python -c "
+          import sys
+          sys.path.insert(0, '/opt/airflow/dags')
+          from data_generator import run_data_generation
+          obj = run_data_generation(num_rows=50)
+          print(f'Uploaded object: {obj}')
+          "
+
+      - name: "Data Flow 2/4: Process — load bronze placeholder"
+        run: |
+          docker exec mdp_airflow_scheduler python -c "
+          from src.data_processor import load_bronze_placeholder
+          load_bronze_placeholder('ci_test_data.csv')
+          print('Bronze load complete.')
+          "
+
+      - name: "Data Flow 3/4: Transform — bronze → silver → gold"
+        run: |
+          docker exec mdp_airflow_scheduler python -c "
+          from src.data_processor import transform_bronze_to_silver, aggregate_silver_to_gold
+          transform_bronze_to_silver()
+          print('Silver transform complete.')
+          aggregate_silver_to_gold()
+          print('Gold aggregation complete.')
+          "
+
+      - name: "Data Flow 4/4: Validate — check row counts"
+        run: |
+          docker exec mdp_airflow_scheduler python -c "
+          from src.data_validation import validate_row_counts
+          ok = validate_row_counts()
+          if not ok:
+              raise SystemExit('Data validation FAILED')
+          print('Data validation PASSED')
+          "
+
+      - name: Verify Metabase can reach gold table
+        run: |
+          docker exec mdp_postgres psql -U mdp_user -d mdp_db -c \
+            "SELECT COUNT(*) AS gold_rows FROM gold.sales_agg_daily;"
+
+      - name: Print data flow summary
+        run: |
+          echo "========================================"
+          echo "  END-TO-END DATA FLOW VALIDATION: OK"
+          echo "========================================"
+          docker exec mdp_postgres psql -U mdp_user -d mdp_db -c \
+            "SELECT 'bronze' AS layer, COUNT(*) AS rows FROM bronze.sales_raw
+             UNION ALL
+             SELECT 'silver', COUNT(*) FROM silver.sales_clean
+             UNION ALL
+             SELECT 'gold', COUNT(*) FROM gold.sales_agg_daily
+             ORDER BY layer;"
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v
