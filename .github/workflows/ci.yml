@@ -61,6 +61,23 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Create .env file for CI/CD
+        run: |
+          cat > .env << EOF
+          POSTGRES_HOST=postgres
+          POSTGRES_PORT=5432
+          POSTGRES_USER=mdp_user
+          POSTGRES_PASSWORD=mdp_pass
+          POSTGRES_DB=mdp_db
+          MINIO_ENDPOINT=minio:9000
+          MINIO_ROOT_USER=minioadmin
+          MINIO_ROOT_PASSWORD=minioadmin123
+          AIRFLOW_USERNAME=mdp-airflow
+          AIRFLOW_PASSWORD=mdp-pass
+          FERNET_KEY=_cumf5Q0qTfXja1ECPpUMUrPORKW6AN3zSzmdo5qxh4=
+          SMTP_PASSWORD=test_password
+          EOF
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -112,6 +129,23 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Create .env file for CI/CD
+        run: |
+          cat > .env << EOF
+          POSTGRES_HOST=postgres
+          POSTGRES_PORT=5432
+          POSTGRES_USER=mdp_user
+          POSTGRES_PASSWORD=mdp_pass
+          POSTGRES_DB=mdp_db
+          MINIO_ENDPOINT=minio:9000
+          MINIO_ROOT_USER=minioadmin
+          MINIO_ROOT_PASSWORD=minioadmin123
+          AIRFLOW_USERNAME=mdp-airflow
+          AIRFLOW_PASSWORD=mdp-pass
+          FERNET_KEY=_cumf5Q0qTfXja1ECPpUMUrPORKW6AN3zSzmdo5qxh4=
+          SMTP_PASSWORD=test_password
+          EOF
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -137,9 +171,7 @@ jobs:
       - name: "Data Flow 1/4: Ingest — generate fake data and upload to MinIO"
         run: |
           docker exec mdp_airflow_scheduler python -c "
-          import sys
-          sys.path.insert(0, '/opt/airflow/dags')
-          from data_generator import run_data_generation
+          from src.data_generator import run_data_generation
           obj = run_data_generation(num_rows=50)
           print(f'Uploaded object: {obj}')
           "
